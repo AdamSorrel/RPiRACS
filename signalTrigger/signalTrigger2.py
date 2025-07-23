@@ -1,0 +1,75 @@
+import redis, sched, time
+import gpiod
+from gpiod.line import Direction, Value
+
+# Trigger pins are the two last pins, closest to the fan power source
+# The inner is ground (pin 39) and the outer is trigger (pin 40 or GPIO21)
+TRIGGER_PIN=21  
+
+def retrieveTime():
+    now = float(time.clock_gettime_ns(time.CLOCK_REALTIME))
+    return now/1e9
+
+def triggerRead(r, triggerPin, triggerTime, triggerData):
+    currentTime = retrieveTime()
+    triggerPin.set_value(TRIGGER_PIN, Value.INACTIVE)
+    time.sleep(0.1)    # Sleep for 100 ms aka. exposure time!
+    triggerPin.set_value(TRIGGER_PIN, Value.ACTIVE)
+    print(f"Triggered read with incoming data: {triggerData}, error: {triggerTime - currentTime}")
+
+# Starting redis server
+r = redis.Redis(host="192.168.222.233", password="redisRacs233", port=6379,decode_responses=True)
+# Checking connection
+if r.ping() == True:
+    print("Connection with the REDIS database established.")
+else:
+    print("ERROR: Connection to the REDIS database was not established. Quitting.")
+    quit()
+
+# Deleting all previous old entries from database
+r.flushdb()
+
+# Setting up a scheduler class
+s = sched.scheduler(timefunc=retrieveTime, delayfunc=time.sleep)
+#s.run()
+
+# Setting up the GPIO chip
+if not gpiod.is_gpiochip_device("/dev/gpiochip4"):
+    print("ERROR: Cannot connect to the GPIO chip. Quitting")
+    quit()
+
+triggerPin = gpiod.request_lines("/dev/gpiochip4", 
+                                 consumer="raman-trigger", 
+                                 config={
+                                     TRIGGER_PIN:   gpiod.LineSettings(
+                                                    direction=Direction.OUTPUT, 
+                                                    output_value=Value.ACTIVE
+                                                    )
+                                 },
+                                )
+
+while True:
+    try:
+        for trigger in r.scan_iter(match="trigger_*"):
+            triggerData = r.get(trigger)
+            # Clearing up processed triggers
+            triggerTime = float(trigger.split("_")[1])
+            triggerTime = triggerTime*1e9
+            currentTime = retrieveTime()
+            timeUntilTrigger = triggerTime-currentTime
+            print(f"Time until trigger: {timeUntilTrigger}")
+            if timeUntilTrigger < 0.1:
+                print(f"Trigger is nigh for trigger {trigger}")
+                # If time until trigger is lower than 100 ms, triggering read threat, which is blocking.
+                s.enterabs(time=triggerTime, priority=10, action=triggerRead, argument=(r, triggerPin, triggerTime, triggerData))
+                s.run()
+            else:
+                print(f"Skipping trigger because it came too late. Time until trigger: {timeUntilTrigger}")
+            r.delete(trigger)
+        time.sleep(0.05)
+    except KeyboardInterrupt:
+        print("Stopping")
+        # Cancelling all upcoming events
+        for event in s.queue:
+            s.cancel(event)
+        quit()
